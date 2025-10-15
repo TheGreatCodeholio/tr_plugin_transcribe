@@ -1,0 +1,69 @@
+{
+  "plugins": [
+    {
+      "name": "Transcribe",
+      "library": "libtranscriber.so",
+      "systems": [
+        {
+          "shortName": "chemung",
+          "audio": "auto",
+          "talkgroups": "*",
+          "api": {
+            "enabled": true,
+            "endpoint": "https://api.openai.com/v1/audio/transcriptions",
+            "model": "whisper-1",
+            "api_key": "",
+            "connect_timeout_ms": 10000,
+            "transfer_timeout_ms": 0,
+            "verify_tls": true
+          }
+        },
+        {
+          "shortName": "steuben",
+          "audio": "m4a",
+          "talkgroups": ["1201", "34000-34999"],
+          "api": {
+            "enabled": true,
+            "endpoint": "https://api.openai.com/v1/audio/transcriptions",
+            "model": "whisper-1",
+            "api_key": "",
+            "connect_timeout_ms": 10000,
+            "transfer_timeout_ms": 0,
+            "verify_tls": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "Storage Uploader",
+      "library": "libstorage_uploader.so",
+      "systems": [
+        {
+          "shortName": "chemung",
+          "uploadJson": true,
+          "deleteAfterUpload": true,
+          "s3": {
+            "enabled": true,
+            "bucket": "chemung-calls",
+            "region": "us-east-1",
+            "prefix_template": "chemung/{yyyy}/{MM}/{dd}/{basename}",
+            "acl": "public-read"
+          }
+        },
+        {
+          "shortName": "steuben",
+          "uploadJson": true,
+          "deleteAfterUpload": false,
+          "sftp": {
+            "enabled": true,
+            "host": "sftp.steuben.net",
+            "port": 22,
+            "username": "upload",
+            "remote_root": "/srv/steuben/calls",
+            "prefix_template": "steuben/{yyyy}/{MM}/{dd}/{basename}"
+          }
+        }
+      ]
+    }
+  ]
+}
