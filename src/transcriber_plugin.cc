@@ -180,7 +180,7 @@ private:
         // response format (for OpenAI whisper endpoints)
         part = curl_mime_addpart(mime);
         curl_mime_name(part, "response_format");
-        curl_mime_data(part, "json", CURL_ZERO_TERMINATED);
+        curl_mime_data(part, "verbose_json", CURL_ZERO_TERMINATED);
 
         curl_easy_setopt(curl, CURLOPT_URL, cfg.api.endpoint.c_str());
         curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
