@@ -11,6 +11,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <cctype>
 
 #include <boost/log/trivial.hpp>
 #include <boost/dll/alias.hpp>
@@ -50,6 +51,66 @@ static size_t append_body(char* ptr, size_t size, size_t nmemb, void* userdata) 
     static_cast<std::string*>(userdata)->append(ptr, total);
     return total;
 }
+
+static void set_transcriber_status(const std::string& json_path,
+                                   const std::string& status,
+                                   const std::string& model = {},
+                                   std::optional<int> talkgroup = std::nullopt,
+                                   std::optional<std::string> error = std::nullopt)
+{
+    if (json_path.empty() || !file_exists(json_path)) return;
+
+    try {
+        std::ifstream in(json_path);
+        json j = json::parse(in);
+        in.close();
+
+        json& node = j["transcriber"];
+        if (!node.is_object()) node = json::object();
+
+        node["status"] = status;
+        if (!model.empty()) node["model"] = model;
+        if (talkgroup.has_value()) node["talkgroup"] = *talkgroup;
+        if (error.has_value()) node["error"] = *error;
+        else if (node.contains("error")) node.erase("error");
+
+        node["updated_at"] = static_cast<long>(std::time(nullptr));
+
+        std::ofstream out(json_path, std::ios::trunc);
+        out << j.dump(2);
+    } catch (...) {
+        // best-effort; ignore errors
+    }
+}
+
+static void write_transcript_done(const std::string& json_path,
+                                  const std::string& text,
+                                  const std::string& model,
+                                  int talkgroup)
+{
+    if (json_path.empty() || !file_exists(json_path)) return;
+
+    try {
+        std::ifstream in(json_path);
+        json j = json::parse(in);
+        in.close();
+
+        json& node = j["transcriber"];
+        if (!node.is_object()) node = json::object();
+
+        node["status"]     = "done";
+        node["transcript"] = text;
+        node["model"]      = model;
+        node["talkgroup"]  = talkgroup;
+        node["updated_at"] = static_cast<long>(std::time(nullptr));
+
+        std::ofstream out(json_path, std::ios::trunc);
+        out << j.dump(2);
+    } catch (const std::exception& e) {
+        TLOG(warning) << "Failed updating JSON transcript: " << e.what();
+    }
+}
+
 
 // --------------- talkgroup rule parser ---------------
 static TalkgroupRule parse_tg_rule(const json& jtg) {
@@ -229,31 +290,6 @@ private:
         }
     }
 
-    static void write_transcript_into_json(const std::string& json_path,
-                                           const std::string& text,
-                                           const TranscribeSystemConfig& cfg,
-                                           int talkgroup)
-    {
-        if (json_path.empty() || !file_exists(json_path)) return;
-
-        try {
-            std::ifstream in(json_path);
-            json j = json::parse(in);
-            in.close();
-
-            json& node = j["transcriber"];
-            if (!node.is_object()) node = json::object();
-            node["transcript"] = text;
-            node["model"]      = cfg.api.model;
-            node["talkgroup"]  = talkgroup;
-
-            std::ofstream out(json_path, std::ios::trunc);
-            out << j.dump(2);
-        } catch (const std::exception& e) {
-            TLOG(warning) << "Failed updating JSON transcript: " << e.what();
-        }
-    }
-
     void run() {
         while (true) {
             TranscribeJob job;
@@ -287,14 +323,18 @@ private:
                 continue;
             }
 
+            set_transcriber_status(job.json_path, "started", cfg.api.model, job.talkgroup);
+
             std::string transcript, err;
             if (!post_transcribe(cfg, audio_path, &transcript, &err)) {
                 TLOG(error) << "[" << job.short_name << "] transcribe failed: " << err;
+                set_transcriber_status(job.json_path, "error", cfg.api.model, job.talkgroup, err);
                 continue;
             }
 
-            write_transcript_into_json(job.json_path, transcript, cfg, job.talkgroup);
+            write_transcript_done(job.json_path, transcript, cfg.api.model, job.talkgroup);
             TLOG(info) << "[" << job.short_name << "] transcript written (" << basename_of(job.json_path) << ")";
+
         }
     }
 
@@ -395,6 +435,29 @@ public:
             j.short_name = call_info.short_name;
             j.start_time = static_cast<std::time_t>(call_info.start_time);
             j.talkgroup  = call_info.talkgroup;
+
+            // Derive JSON if missing (rare, but keeps things robust)
+            if (j.json_path.empty()) {
+                try {
+                    std::string p = !j.audio_m4a.empty() ? j.audio_m4a : j.audio_wav;
+                    if (!p.empty()) {
+                        // simple extension swap
+                        auto pos = p.find_last_of('.');
+                        if (pos != std::string::npos) j.json_path = p.substr(0, pos) + ".json";
+                        else                          j.json_path = p + ".json";
+                    }
+                } catch (...) {}
+            }
+
+            // Look up config early so we can decide whether to stamp "queued"
+            auto it = cfg_by_system_.find(j.short_name);
+            if (it != cfg_by_system_.end()) {
+                const auto& sc = it->second;
+                if (sc.enabled && sc.tg_rule.matches(j.talkgroup)) {
+                    // Make MQTT "presence probe" see us immediately
+                    set_transcriber_status(j.json_path, "queued", sc.api.model, j.talkgroup);
+                }
+            }
 
             if (worker_) worker_->enqueue(j);
         } catch (...) {
