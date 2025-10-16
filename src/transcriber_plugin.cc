@@ -52,6 +52,50 @@ static size_t append_body(char* ptr, size_t size, size_t nmemb, void* userdata) 
     return total;
 }
 
+static bool load_json_with_retries(const std::string& path,
+                                   nlohmann::json* out,
+                                   int tries = 10,
+                                   int delay_ms = 50) {
+    for (int i = 0; i < tries; ++i) {
+        try {
+            std::ifstream in(path);
+            if (!in.good()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                continue;
+            }
+            *out = nlohmann::json::parse(in, /*cb*/nullptr, /*allow_exceptions*/true, /*ignore_comments*/true);
+            return true;
+        } catch (...) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+    }
+    return false;
+}
+
+// Atomic JSON writer: write to .tmp then rename over target
+static bool atomic_write_json_file(const std::string& path, const nlohmann::json& j) {
+    try {
+        fs::path p(path);
+        fs::path tmp = p; tmp += ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            out << j.dump(2);
+            out.flush();
+            if (!out) return false;
+        }
+        std::error_code ec;
+        fs::rename(tmp, p, ec);                 // atomic on POSIX
+        if (ec) {
+            fs::remove(p, ec);                    // best-effort remove then retry
+            ec.clear();
+            fs::rename(tmp, p, ec);
+            if (ec) return false;
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+
 static void set_transcriber_status(const std::string& json_path,
                                    const std::string& status,
                                    const std::string& model = {},
@@ -61,27 +105,28 @@ static void set_transcriber_status(const std::string& json_path,
     if (json_path.empty() || !file_exists(json_path)) return;
 
     try {
-        std::ifstream in(json_path);
-        json j = json::parse(in);
-        in.close();
+        nlohmann::json j;
+        if (!load_json_with_retries(json_path, &j)) {
+            // best-effort: start a fresh object if concurrent writer mid-write
+            j = nlohmann::json::object();
+        }
 
-        json& node = j["transcriber"];
-        if (!node.is_object()) node = json::object();
+        nlohmann::json& node = j["transcriber"];
+        if (!node.is_object()) node = nlohmann::json::object();
 
         node["status"] = status;
-        if (!model.empty()) node["model"] = model;
+        if (!model.empty())       node["model"] = model;
         if (talkgroup.has_value()) node["talkgroup"] = *talkgroup;
-        if (error.has_value()) node["error"] = *error;
+        if (error.has_value())     node["error"]     = *error;
         else if (node.contains("error")) node.erase("error");
-
         node["updated_at"] = static_cast<long>(std::time(nullptr));
 
-        std::ofstream out(json_path, std::ios::trunc);
-        out << j.dump(2);
+        (void) atomic_write_json_file(json_path, j);
     } catch (...) {
         // best-effort; ignore errors
     }
 }
+
 
 static void write_transcript_done(const std::string& json_path,
                                   const std::string& text,
@@ -91,12 +136,14 @@ static void write_transcript_done(const std::string& json_path,
     if (json_path.empty() || !file_exists(json_path)) return;
 
     try {
-        std::ifstream in(json_path);
-        json j = json::parse(in);
-        in.close();
+        nlohmann::json j;
+        if (!load_json_with_retries(json_path, &j)) {
+            // if we can't read, still produce a minimal valid JSON
+            j = nlohmann::json::object();
+        }
 
-        json& node = j["transcriber"];
-        if (!node.is_object()) node = json::object();
+        nlohmann::json& node = j["transcriber"];
+        if (!node.is_object()) node = nlohmann::json::object();
 
         node["status"]     = "done";
         node["transcript"] = text;
@@ -104,12 +151,14 @@ static void write_transcript_done(const std::string& json_path,
         node["talkgroup"]  = talkgroup;
         node["updated_at"] = static_cast<long>(std::time(nullptr));
 
-        std::ofstream out(json_path, std::ios::trunc);
-        out << j.dump(2);
+        if (!atomic_write_json_file(json_path, j)) {
+            TLOG(warning) << "Atomic write failed for transcript JSON: " << json_path;
+        }
     } catch (const std::exception& e) {
         TLOG(warning) << "Failed updating JSON transcript: " << e.what();
     }
 }
+
 
 
 // --------------- talkgroup rule parser ---------------
